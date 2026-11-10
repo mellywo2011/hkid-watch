@@ -1,0 +1,58 @@
+name: hkid-watch
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_push:
+        description: 'Send a "watcher started" test push'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write   # commit state.json back
+  actions: write    # disable this workflow after the stop time
+
+concurrency:
+  group: hkid-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Stop after Fri Nov 13 16:30 HKT
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(date -u +%s)" -gt "$(date -u -d '2026-11-13T08:30:00Z' +%s)" ]; then
+            echo "Past the stop time. Disabling this workflow."
+            gh workflow disable watch.yml --repo "$GITHUB_REPOSITORY" || true
+            echo "stop=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v5
+        if: steps.gate.outputs.stop != 'true'
+
+      - name: Check the feed
+        if: steps.gate.outputs.stop != 'true'
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TEST_PUSH: ${{ github.event_name == 'workflow_dispatch' && inputs.test_push }}
+        run: python3 watch.py
+
+      - name: Save state if it changed
+        if: steps.gate.outputs.stop != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if git diff --cached --quiet; then
+            echo "No state change."
+          else
+            git commit -m "Update state"
+            git push || { git pull --rebase && git push; }
+          fi
