@@ -1,8 +1,12 @@
 name: hkid-watch
 
+# GitHub's cron is too unreliable to count on, so each run loops for about
+# 5 hours, checking every 5 minutes, then starts the next run itself. The
+# hourly schedule only restarts the chain if it ever breaks.
+
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '17 * * * *'
   workflow_dispatch:
     inputs:
       test_push:
@@ -12,47 +16,50 @@ on:
 
 permissions:
   contents: write   # commit state.json back
-  actions: write    # disable this workflow after the stop time
+  actions: write    # start the next run, or disable after the stop time
 
 concurrency:
   group: hkid-watch
   cancel-in-progress: false
 
+env:
+  STOP_EPOCH: '1794558600'   # 2026-11-13 16:30 HKT
+  GH_TOKEN: ${{ github.token }}
+
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 350
     steps:
-      - name: Stop after Fri Nov 13 16:30 HKT
-        id: gate
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if [ "$(date -u +%s)" -gt "$(date -u -d '2026-11-13T08:30:00Z' +%s)" ]; then
-            echo "Past the stop time. Disabling this workflow."
-            gh workflow disable watch.yml --repo "$GITHUB_REPOSITORY" || true
-            echo "stop=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: actions/checkout@v5
-        if: steps.gate.outputs.stop != 'true'
 
-      - name: Check the feed
-        if: steps.gate.outputs.stop != 'true'
+      - name: Check every 5 minutes for about 5 hours
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          TEST_PUSH: ${{ github.event_name == 'workflow_dispatch' && inputs.test_push }}
-        run: python3 watch.py
-
-      - name: Save state if it changed
-        if: steps.gate.outputs.stop != 'true'
+          FIRST_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.test_push }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
-          git add state.json
-          if git diff --cached --quiet; then
-            echo "No state change."
+          end=$(( $(date +%s) + 5 * 3600 ))
+          test_push="$FIRST_TEST"
+          while [ "$(date +%s)" -lt "$end" ] && [ "$(date +%s)" -lt "$STOP_EPOCH" ]; do
+            TEST_PUSH="$test_push" python3 watch.py || echo "check failed"
+            test_push=false
+            git add state.json
+            if ! git diff --cached --quiet; then
+              git commit -q -m "Update state"
+              git push -q || { git pull -q --rebase && git push -q; } || echo "state push failed"
+            fi
+            sleep 300
+          done
+
+      - name: Start the next run, or stop after Fri Nov 13 16:30 HKT
+        if: always()
+        run: |
+          if [ "$(date +%s)" -ge "$STOP_EPOCH" ]; then
+            echo "Past the stop time. Disabling this workflow."
+            gh workflow disable watch.yml --repo "$GITHUB_REPOSITORY"
           else
-            git commit -m "Update state"
-            git push || { git pull --rebase && git push; }
+            gh workflow run watch.yml --repo "$GITHUB_REPOSITORY" -f test_push=false
+            echo "Next run queued."
           fi
